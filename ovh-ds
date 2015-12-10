@@ -1,0 +1,111 @@
+#!/usr/bin/python
+
+execfile('venv/bin/activate_this.py', dict(__file__='venv/bin/activate_this.py'))
+
+import argparse
+import collections
+import logging
+import re
+import sys
+
+import ovh
+
+opendnssec_input_parser = re.compile('^(?P<domain>[^\s]+)\s*(?P<ttl>\d+)\s*IN\s*DNSKEY\s*(?P<flags>\d+)\s*(?P<protocol>\d+)\s*(?P<algorithm>\d*)\s*(?P<publicKey>[^\s]*)\s*;{id = (?P<tag>\d+) \((?P<tag_type>[^\s]*)\), size = (?P<key_size>[^\s]*)}$', re.M)
+
+parser = argparse.ArgumentParser(description='OpenDNSSEC managment utility to view/add/delete DS from OVH.')
+subparsers = parser.add_subparsers(dest='action')
+subparsers.add_parser('list')
+subparsers.add_parser('sync')
+subparsers.add_parser('seen')
+
+
+args = parser.parse_args()
+
+client = ovh.Client()
+
+access_rules = [
+    {'method': 'GET', 'path': '/*'},
+    {'method': 'POST', 'path': '/*'},
+    {'method': 'PUT', 'path': '/*'},
+    {'method': 'DELETE', 'path': '/*'}
+]
+
+def get_new_consumer_key():
+    validation = client.request_consumerkey(access_rules)
+    print "Please visit %s to authenticate" % validation['validationUrl']
+    raw_input("and press Enter to continue...")
+    print "Welcome", client.get('/me')['firstname']
+    print "Btw, your 'consumerKey' is '%s'" % validation['consumerKey']
+
+
+#print "Welcome", client.get('/me')['firstname']
+
+def get_ovh_dsrecords():
+    dsrecords = collections.defaultdict(dict)
+    for domain in client.get("/domain"):
+        for ds in client.get("/domain/%s/dsRecord" % domain):
+            record = client.get("/domain/%s/dsRecord/%s" % (domain, ds))
+            dsrecords[domain][record["tag"]] = record
+    return dsrecords
+
+def get_opendnssec_dsrecords():
+    dsrecords = collections.defaultdict(dict)
+    for ds in opendnssec_input_parser.finditer("".join(sys.stdin)):
+        record = dict(ds.groupdict())
+        domain = record.pop("domain").rstrip(".")
+        # NOTE(sileht): build same dict as ovh
+        record["status"] = "unknown"
+        record["id"] = "unknown"
+        del record["key_size"]
+        del record["tag_type"]
+        del record["ttl"]
+        dsrecords[domain][record["tag"]] = record
+    return dict(dsrecords)
+
+def print_dsrecords(dsrecords):
+    for domain, records in dsrecords.items():
+        print "* Domain %s" % domain
+        for ds in records.values():
+            print "%(tag)s (%(status)s/%(id)s): %(flags)s %(algorithm)s %(publicKey)s" % ds
+
+if args.action == "list":
+    print_dsrecords(get_ovh_dsrecords())
+elif args.action == "sync":
+    print "OVH Records:"
+    print "============"
+    ovh = get_ovh_dsrecords()
+    print_dsrecords(ovh)
+    print
+    print "OpenDNSSEC Records:"
+    print "==================="
+    opendnssec = get_opendnssec_dsrecords()
+    print_dsrecords(opendnssec)
+    print
+    print "Processing keys:"
+    print "================"
+    for domain, records in opendnssec.items():
+        refresh = False
+        # For now, we never delete ovh dnskey
+        new_keys = ovh[domain]
+        for tag, key in records.items():
+            if tag not in new_keys:
+                refresh=True
+                new_keys[tag] = key
+        if refresh:
+            new_keys = [{"algorithm": key["algorithm"],
+                         "flags": key["flags"],
+                         "tag": key["tag"],
+                         "publicKey": key["publicKey"]}
+                        for key in new_keys.values()]
+            print "POST: '/domain/%s/dsRecord' keys=%s" % (domain, new_keys)
+            #print client.post('/domain/%s/dsRecord' % domain, keys=new_keys)
+    print
+    print "New OVH Records:"
+    print "================"
+    ovh = get_ovh_dsrecords()
+    print_dsrecords(ovh)
+
+elif args.action == "seen":
+    pass
+else:
+    print "Invalid action"
